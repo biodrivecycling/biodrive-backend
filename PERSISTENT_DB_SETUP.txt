@@ -1,0 +1,75 @@
+BioDrive — Permanent database setup (plain English)
+=====================================================
+
+WHY
+- Right now user accounts can disappear when Render restarts (free temporary disk).
+- A permanent database keeps signups, passwords, profile, and Step 1 data safe.
+
+WHAT YOU WILL USE
+- Neon (free database) — stores the data
+- Render (your existing API) — still runs the website backend
+- You do NOT need the $25 Render plan for this
+
+--------------------------------------------------
+STEP 1 — Create a free database on Neon
+--------------------------------------------------
+1. Go to https://neon.tech and sign up (GitHub login is fine)
+2. Create a project (name it biodrive)
+3. After it opens, find the connection string.
+   It looks like:
+   postgresql://someone:password@ep-xxx.neon.tech/neondb?sslmode=require
+4. Copy the WHOLE string (there is often a "Copy" button)
+
+--------------------------------------------------
+STEP 2 — Put that string into Render
+--------------------------------------------------
+1. Open https://dashboard.render.com
+2. Click your biodrive-backend service
+3. Left side: Environment
+4. Add Environment Variable:
+   KEY:   DATABASE_URL
+   VALUE: (paste the Neon connection string)
+5. Keep your existing:
+   BD_DEMO_EMAIL = 1
+   BD_CORS_ORIGINS = https://biodrivecycling.com
+6. Save
+
+--------------------------------------------------
+STEP 3 — Upload the new backend code
+--------------------------------------------------
+1. Download biodrive-backend-for-github.zip (from Grok)
+2. Unzip it
+3. Upload these files to your GitHub biodrive-backend repo (replace old ones):
+   - server.py
+   - requirements.txt   <-- NEW, important
+   - Procfile
+   - runtime.txt
+4. Commit to main
+5. On Render: Manual Deploy → Deploy latest commit
+6. Wait until Live
+
+--------------------------------------------------
+STEP 4 — Check it worked
+--------------------------------------------------
+Open:
+  https://biodrive-backend.onrender.com/api/health
+
+You want something like:
+  "database": "postgres"
+  "version": 2.1
+
+If it still says "sqlite", DATABASE_URL is missing or the deploy did not finish.
+
+--------------------------------------------------
+STEP 5 — Create accounts again (one time)
+--------------------------------------------------
+Old accounts were on the temporary disk and will not move over automatically.
+Sign up once more on the live site, verify, save profile / Step 1.
+After that, redeploys should NOT wipe users.
+
+--------------------------------------------------
+COST
+--------------------------------------------------
+Neon free tier: $0 for this stage
+Render free web service: still OK for testing
+Later you can pay small amounts only if you need always-on speed
