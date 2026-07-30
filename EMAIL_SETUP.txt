@@ -1,0 +1,23 @@
+BioDrive — Real verification emails (Resend)
+============================================
+
+1) Create account at https://resend.com
+2) API Keys → Create API Key → copy it (starts with re_)
+3) For testing, Resend allows from: onboarding@resend.dev
+   (Emails can only be SENT TO your own Resend signup email until you verify a domain)
+4) For production: Resend → Domains → add biodrivecycling.com and add the DNS records they show
+
+Render Environment variables to ADD:
+  RESEND_API_KEY = re_xxxxxxxx
+  EMAIL_FROM = BioDrive Cycling <onboarding@resend.dev>
+      (later: BioDrive Cycling <noreply@biodrivecycling.com>)
+  APP_PUBLIC_URL = https://biodrivecycling.com
+  BD_DEMO_EMAIL = 0
+
+Keep existing DATABASE_URL, BD_CORS_ORIGINS.
+
+After deploy, /api/health should show:
+  "emailConfigured": true
+  "demoEmail": false
+
+Test: sign up with an email you can open → check inbox for verify link.

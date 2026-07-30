@@ -11,6 +11,9 @@ DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
 DB_PATH = os.environ.get("BD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "biodrive.db"))
 CORS_ORIGINS = [o.strip() for o in os.environ.get("BD_CORS_ORIGINS", "https://biodrivecycling.com,https://www.biodrivecycling.com,null").split(",") if o.strip()]
 DEMO_EMAIL = os.environ.get("BD_DEMO_EMAIL", "1") == "1"
+RESEND_API_KEY = (os.environ.get("RESEND_API_KEY") or "").strip()
+EMAIL_FROM = (os.environ.get("EMAIL_FROM") or "BioDrive Cycling <onboarding@resend.dev>").strip()
+APP_PUBLIC_URL = (os.environ.get("APP_PUBLIC_URL") or "https://biodrivecycling.com").rstrip("/")
 SESSION_DAYS = int(os.environ.get("BD_SESSION_DAYS", "30"))
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 USE_PG = bool(DATABASE_URL)
@@ -174,6 +177,58 @@ def set_json(conn, table, user_id, data):
     else:
         q(conn, "INSERT INTO %s (user_id, data_json, updated_at) VALUES (?, ?, ?) ON CONFLICT(user_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at" % table, (user_id, payload, now))
 
+
+def send_verification_email(to_email, token):
+    """Send verify link via Resend. Returns (ok, detail)."""
+    verify_url = APP_PUBLIC_URL + "/biodrive-verify.html?token=" + token + "&email=" + to_email
+    subject = "Verify your BioDrive Cycling account"
+    html = (
+        "<p>Welcome to BioDrive Cycling.</p>"
+        "<p>Please verify your email by clicking the link below:</p>"
+        '<p><a href="%s">Verify my email</a></p>'
+        "<p>Or copy this URL:</p><p>%s</p>"
+        "<p>This link expires in 48 hours.</p>"
+        "<p>If you did not create an account, you can ignore this email.</p>"
+    ) % (verify_url, verify_url)
+    text = "Verify your BioDrive account: " + verify_url
+
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not set"
+
+    import urllib.request
+    payload = json.dumps({
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": text,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + RESEND_API_KEY,
+            "Content-Type": "application/json",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print("[email] sent to", to_email, "status", resp.status, body[:200])
+            return True, body
+    except Exception as e:
+        # urllib HTTPError
+        detail = str(e)
+        try:
+            if hasattr(e, "read"):
+                detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        print("[email] FAILED to", to_email, detail)
+        return False, detail
+
+
 class Handler(BaseHTTPRequestHandler):
     server_version = "BioDriveAPI/2.2"
     def log_message(self, fmt, *args):
@@ -212,7 +267,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.2, "demoEmail": DEMO_EMAIL, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.2, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "database": "postgres" if USE_PG else "sqlite"})
         if path in ("/api/auth/me", "/api/profile", "/api/powers"):
             conn = connect()
             try:
@@ -292,10 +347,22 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
         body = {"ok": True, "message": "Account created. Please verify your email to continue.",
                 "user": {"id": user_id, "email": email, "firstName": first, "lastName": last, "emailVerified": False}}
-        if DEMO_EMAIL:
+        # Real email when Resend is configured and demo mode is off
+        if RESEND_API_KEY and not DEMO_EMAIL:
+            ok_send, detail = send_verification_email(email, verify_token)
+            if not ok_send:
+                body["message"] = "Account created, but the verification email could not be sent. Please try resend or contact support."
+                body["emailError"] = True
+                print("[email] signup send failed:", detail)
+            else:
+                body["message"] = "Account created. Check your email for a verification link."
+        else:
+            # Demo / local testing path
             body["verificationToken"] = verify_token
-            body["verificationPath"] = "biodrive-verify.html?token=" + verify_token
+            body["verificationPath"] = "biodrive-verify.html?token=" + verify_token + "&email=" + email
             print("[demo-email] token for", email, verify_token)
+            if not RESEND_API_KEY:
+                print("[email] RESEND_API_KEY not set — using demo verification link")
         return self._send(201, body)
     def _login(self, data):
         email = (data.get("email") or "").strip().lower()
@@ -355,9 +422,13 @@ class Handler(BaseHTTPRequestHandler):
             if user and not g(user, "email_verified"):
                 token = create_email_token(conn, g(user, "id"), "verify_email", 48)
                 conn.commit()
-                if DEMO_EMAIL:
+                if RESEND_API_KEY and not DEMO_EMAIL:
+                    ok_send, detail = send_verification_email(email, token)
+                    if not ok_send:
+                        print("[email] resend failed:", detail)
+                else:
                     body["verificationToken"] = token
-                    body["verificationPath"] = "biodrive-verify.html?token=" + token
+                    body["verificationPath"] = "biodrive-verify.html?token=" + token + "&email=" + email
         finally:
             conn.close()
         return self._send(200, body)
