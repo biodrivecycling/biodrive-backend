@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""BioDrive Auth API — stdlib only."""
+"""BioDrive Auth + Profile API (steps 1–2). Stdlib only."""
 from __future__ import annotations
 import hashlib, json, os, re, secrets, sqlite3, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -8,7 +8,7 @@ from urllib.parse import urlparse
 HOST = os.environ.get("BD_HOST") or os.environ.get("HOST") or "0.0.0.0"
 PORT = int(os.environ.get("BD_PORT") or os.environ.get("PORT") or "8787")
 DB_PATH = os.environ.get("BD_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "biodrive.db"))
-CORS_ORIGINS = [o.strip() for o in os.environ.get("BD_CORS_ORIGINS", "http://localhost:5500,http://127.0.0.1:5500,null").split(",") if o.strip()]
+CORS_ORIGINS = [o.strip() for o in os.environ.get("BD_CORS_ORIGINS", "http://localhost:5500,http://127.0.0.1:5500,https://biodrivecycling.com,null").split(",") if o.strip()]
 DEMO_EMAIL = os.environ.get("BD_DEMO_EMAIL", "1") == "1"
 SESSION_DAYS = int(os.environ.get("BD_SESSION_DAYS", "30"))
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
@@ -47,6 +47,16 @@ def init_db():
               created_at REAL NOT NULL,
               expires_at REAL NOT NULL,
               used_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS profiles (
+              user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+              data_json TEXT NOT NULL DEFAULT '{}',
+              updated_at REAL NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS powers (
+              user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+              data_json TEXT NOT NULL DEFAULT '{}',
+              updated_at REAL NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
             CREATE INDEX IF NOT EXISTS idx_sessions_user ON sessions(user_id);
@@ -93,8 +103,46 @@ def session_user(conn, token):
     if not token: return None
     return conn.execute("SELECT u.* FROM sessions s JOIN users u ON u.id = s.user_id WHERE s.token = ? AND s.expires_at > ?", (token, time.time())).fetchone()
 
+def get_profile_json(conn, user_id):
+    row = conn.execute("SELECT data_json FROM profiles WHERE user_id = ?", (user_id,)).fetchone()
+    if not row: return {}
+    try:
+        data = json.loads(row["data_json"] or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def set_profile_json(conn, user_id, data):
+    now = time.time()
+    payload = json.dumps(data if isinstance(data, dict) else {})
+    conn.execute(
+        """INSERT INTO profiles (user_id, data_json, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at""",
+        (user_id, payload, now),
+    )
+    return now
+
+def get_powers_json(conn, user_id):
+    row = conn.execute("SELECT data_json FROM powers WHERE user_id = ?", (user_id,)).fetchone()
+    if not row: return {}
+    try:
+        data = json.loads(row["data_json"] or "{}")
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+def set_powers_json(conn, user_id, data):
+    now = time.time()
+    payload = json.dumps(data if isinstance(data, dict) else {})
+    conn.execute(
+        """INSERT INTO powers (user_id, data_json, updated_at) VALUES (?, ?, ?)
+           ON CONFLICT(user_id) DO UPDATE SET data_json = excluded.data_json, updated_at = excluded.updated_at""",
+        (user_id, payload, now),
+    )
+    return now
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAuth/1.0"
+    server_version = "BioDriveAPI/2.0"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -107,7 +155,7 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Access-Control-Allow-Origin", allow)
             self.send_header("Access-Control-Allow-Credentials", "true")
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Vary", "Origin")
     def _read_json(self):
         length = int(self.headers.get("Content-Length") or 0)
@@ -134,12 +182,30 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "demoEmail": DEMO_EMAIL})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2, "demoEmail": DEMO_EMAIL})
         if path == "/api/auth/me":
             with db() as conn:
                 user = session_user(conn, self._bearer())
                 if not user: return self._send(401, {"error": "Not authenticated."})
-                return self._send(200, {"user": user_public(user)})
+                return self._send(200, {"user": user_public(user), "profile": get_profile_json(conn, user["id"]), "powers": get_powers_json(conn, user["id"])})
+        if path == "/api/profile":
+            with db() as conn:
+                user = session_user(conn, self._bearer())
+                if not user: return self._send(401, {"error": "Not authenticated."})
+                return self._send(200, {"profile": get_profile_json(conn, user["id"])})
+        if path == "/api/powers":
+            with db() as conn:
+                user = session_user(conn, self._bearer())
+                if not user: return self._send(401, {"error": "Not authenticated."})
+                return self._send(200, {"powers": get_powers_json(conn, user["id"])})
+        return self._send(404, {"error": "Not found."})
+    def do_PUT(self):
+        path = urlparse(self.path).path
+        data = self._read_json()
+        if path == "/api/profile":
+            return self._put_profile(data)
+        if path == "/api/powers":
+            return self._put_powers(data)
         return self._send(404, {"error": "Not found."})
     def do_POST(self):
         path = urlparse(self.path).path
@@ -149,7 +215,37 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/logout": return self._logout()
         if path == "/api/auth/verify": return self._verify(data)
         if path == "/api/auth/resend-verification": return self._resend(data)
+        # Allow POST as alias for profile/powers save (some hosts)
+        if path == "/api/profile": return self._put_profile(data)
+        if path == "/api/powers": return self._put_powers(data)
         return self._send(404, {"error": "Not found."})
+    def _put_profile(self, data):
+        with db() as conn:
+            user = session_user(conn, self._bearer())
+            if not user: return self._send(401, {"error": "Not authenticated."})
+            # Accept either {profile: {...}} or raw profile object
+            profile = data.get("profile") if isinstance(data.get("profile"), dict) else data
+            if not isinstance(profile, dict):
+                return self._send(400, {"error": "Profile must be a JSON object."})
+            # Keep names in sync on users table when provided
+            first = (profile.get("firstName") or "").strip()
+            last = (profile.get("lastName") or "").strip()
+            if first or last:
+                conn.execute(
+                    "UPDATE users SET first_name = COALESCE(NULLIF(?, ''), first_name), last_name = COALESCE(NULLIF(?, ''), last_name), updated_at = ? WHERE id = ?",
+                    (first, last, time.time(), user["id"]),
+                )
+            set_profile_json(conn, user["id"], profile)
+            return self._send(200, {"ok": True, "profile": get_profile_json(conn, user["id"])})
+    def _put_powers(self, data):
+        with db() as conn:
+            user = session_user(conn, self._bearer())
+            if not user: return self._send(401, {"error": "Not authenticated."})
+            powers = data.get("powers") if isinstance(data.get("powers"), dict) else data
+            if not isinstance(powers, dict):
+                return self._send(400, {"error": "Powers must be a JSON object."})
+            set_powers_json(conn, user["id"], powers)
+            return self._send(200, {"ok": True, "powers": get_powers_json(conn, user["id"])})
 
     def _signup(self, data):
         email = (data.get("email") or "").strip().lower()
@@ -168,6 +264,7 @@ class Handler(BaseHTTPRequestHandler):
             with db() as conn:
                 conn.execute("INSERT INTO users (id, email, password_hash, password_salt, first_name, last_name, email_verified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)", (user_id, email, pw_hash, salt, first, last, now, now))
                 verify_token = create_email_token(conn, user_id, "verify_email", hours=48)
+                set_profile_json(conn, user_id, {"firstName": first, "lastName": last, "name": (first + " " + last).strip(), "email": email, "bikes": []})
         except sqlite3.IntegrityError:
             return self._send(409, {"error": "An account with that email already exists."})
         body = {"ok": True, "message": "Account created. Please verify your email to continue.", "user": {"id": user_id, "email": email, "firstName": first, "lastName": last, "emailVerified": False}}
@@ -187,7 +284,7 @@ class Handler(BaseHTTPRequestHandler):
             if not row["email_verified"]:
                 return self._send(403, {"error": "Email not verified.", "code": "EMAIL_NOT_VERIFIED", "email": row["email"]})
             token = create_session(conn, row["id"])
-            return self._send(200, {"ok": True, "token": token, "user": user_public(row)})
+            return self._send(200, {"ok": True, "token": token, "user": user_public(row), "profile": get_profile_json(conn, row["id"]), "powers": get_powers_json(conn, row["id"])})
     def _logout(self):
         token = self._bearer()
         if token:
@@ -207,7 +304,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.execute("UPDATE users SET email_verified = 1, updated_at = ? WHERE id = ?", (now, row["user_id"]))
             user = conn.execute("SELECT * FROM users WHERE id = ?", (row["user_id"],)).fetchone()
             session = create_session(conn, row["user_id"])
-            return self._send(200, {"ok": True, "message": "Email verified.", "token": session, "user": user_public(user)})
+            return self._send(200, {"ok": True, "message": "Email verified.", "token": session, "user": user_public(user), "profile": get_profile_json(conn, user["id"]), "powers": get_powers_json(conn, user["id"])})
     def _resend(self, data):
         email = (data.get("email") or "").strip().lower()
         if not email or not EMAIL_RE.match(email): return self._send(400, {"error": "Please enter a valid email."})
@@ -224,8 +321,9 @@ class Handler(BaseHTTPRequestHandler):
 def main():
     init_db()
     httpd = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("BioDrive auth API listening on http://%s:%s" % (HOST, PORT))
+    print("BioDrive API listening on http://%s:%s" % (HOST, PORT))
     print("  DB: %s" % DB_PATH)
+    print("  Endpoints: /api/health /api/auth/* /api/profile /api/powers")
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
