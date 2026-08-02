@@ -638,7 +638,7 @@ def save_order_data(conn, order_id, data, status=None):
           (json.dumps(data), now, order_id))
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAPI/2.8"
+    server_version = "BioDriveAPI/2.9"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -683,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.8, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.9, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -1030,12 +1030,20 @@ class Handler(BaseHTTPRequestHandler):
             status = (g(row, "status") or "").lower()
             if status == "pending_payment":
                 return self._send(403, {"error": "This request is not paid yet."})
-            # ownership check
-            cemail = (g(coach, "email") or "").lower()
+            # ownership check (id, email, or display name — same rules as job list)
+            cemail = (g(coach, "email") or "").strip().lower()
+            cname = (g(coach, "name") or "").strip().lower()
+            cid = g(coach, "id")
             coach_data = payload.get("coach") or {}
-            assigned_email = (coach_data.get("email") or "").lower() if isinstance(coach_data, dict) else ""
-            assigned_id = payload.get("coachId") or (coach_data.get("id") if isinstance(coach_data, dict) else None)
-            if assigned_id != g(coach, "id") and assigned_email != cemail:
+            assigned_email = ""
+            assigned_name = ""
+            assigned_id = payload.get("coachId")
+            if isinstance(coach_data, dict):
+                assigned_email = (coach_data.get("email") or "").strip().lower()
+                assigned_name = (coach_data.get("displayName") or coach_data.get("name") or "").strip().lower()
+                if not assigned_id:
+                    assigned_id = coach_data.get("id")
+            if assigned_id != cid and assigned_email != cemail and assigned_name != cname:
                 return self._send(403, {"error": "This job is not assigned to you."})
             if accept:
                 payload["offerStatus"] = "accepted"
