@@ -490,7 +490,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.5, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.7, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -511,7 +511,7 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(404, {"error": "Not found."})
             finally:
                 conn.close()
-        if path in ("/api/admin/users", "/api/admin/orders", "/api/admin/summary"):
+        if path in ("/api/admin/users", "/api/admin/orders", "/api/admin/summary", "/api/admin/coaches"):
             if not ADMIN_KEY:
                 return self._send(503, {"error": "Admin is not configured. Set BD_ADMIN_KEY on the server."})
             if not require_admin(self):
@@ -522,8 +522,11 @@ class Handler(BaseHTTPRequestHandler):
                     return self._send(200, {"users": list_all_users(conn)})
                 if path == "/api/admin/orders":
                     return self._send(200, {"orders": list_all_orders(conn)})
+                if path == "/api/admin/coaches":
+                    return self._send(200, {"coaches": list_coaches(conn)})
                 users = list_all_users(conn)
                 orders = list_all_orders(conn)
+                coaches = list_coaches(conn)
                 pending_payment = sum(1 for o in orders if (o.get("status") or "").startswith("pending_payment"))
                 pending_offers = sum(1 for o in orders if (o.get("offerStatus") or "") in ("offered", "pending"))
                 return self._send(200, {
@@ -532,9 +535,31 @@ class Handler(BaseHTTPRequestHandler):
                         "orderCount": len(orders),
                         "pendingPaymentCount": pending_payment,
                         "pendingOfferCount": pending_offers,
+                        "coachCount": len(coaches),
                     },
                     "users": users,
                     "orders": orders,
+                    "coaches": coaches,
+                })
+            finally:
+                conn.close()
+        if path == "/api/coach/jobs":
+            from urllib.parse import parse_qs
+            params = parse_qs(urlparse(self.path).query)
+            token = (params.get("key") or [""])[0].strip()
+            if not token:
+                token = (self.headers.get("X-Coach-Key") or "").strip()
+            conn = connect()
+            try:
+                coach = coach_by_token(conn, token)
+                if not coach:
+                    return self._send(401, {"error": "Invalid coach link."})
+                if not g(coach, "link_enabled"):
+                    return self._send(403, {"error": "This coach link has been disabled by BioDrive admin."})
+                jobs = list_coach_jobs(conn, coach)
+                return self._send(200, {
+                    "coach": {"id": g(coach, "id"), "name": g(coach, "name"), "email": g(coach, "email")},
+                    "jobs": jobs,
                 })
             finally:
                 conn.close()
@@ -553,6 +578,11 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/reset-password": return self._reset_password(data)
         if path in ("/api/profile", "/api/powers"): return self._write(path, data)
         if path == "/api/orders": return self._create_order(data)
+        if path == "/api/admin/coaches": return self._admin_create_coach(data)
+        if path == "/api/admin/coaches/toggle": return self._admin_toggle_coach(data)
+        if path == "/api/admin/orders/mark-paid": return self._admin_mark_paid(data)
+        if path == "/api/coach/accept": return self._coach_respond(data, accept=True)
+        if path == "/api/coach/reject": return self._coach_respond(data, accept=False)
         return self._send(404, {"error": "Not found."})
     def _write(self, path, data):
         conn = connect()
@@ -673,6 +703,160 @@ class Handler(BaseHTTPRequestHandler):
         finally:
             conn.close()
 
+
+
+    def _admin_create_coach(self, data):
+        if not ADMIN_KEY:
+            return self._send(503, {"error": "Admin is not configured."})
+        if not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        name = (data.get("name") or "").strip()
+        email = (data.get("email") or "").strip().lower()
+        if not name or not email or not EMAIL_RE.match(email):
+            return self._send(400, {"error": "Name and valid email are required."})
+        conn = connect()
+        try:
+            cid = "coach_" + secrets.token_hex(8)
+            token = secrets.token_urlsafe(32)
+            now = time.time()
+            q(conn, "INSERT INTO coaches (id, name, email, magic_token, link_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+              (cid, name, email, token, 1, now, now))
+            conn.commit()
+            link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + token
+            # Optional onboard email
+            if RESEND_API_KEY and not DEMO_EMAIL:
+                html = "<p>Hi %s,</p><p>Your BioDrive coach access link:</p><p><a href='%s'>%s</a></p><p>Keep this link private. BioDrive admin can disable it at any time.</p>" % (name, link, link)
+                send_simple_email(email, "Your BioDrive coach access", html, "Your BioDrive coach link: " + link)
+            return self._send(201, {"ok": True, "coach": {
+                "id": cid, "name": name, "email": email, "magicToken": token,
+                "linkEnabled": True, "magicLink": link,
+            }, "coaches": list_coaches(conn)})
+        finally:
+            conn.close()
+
+    def _admin_toggle_coach(self, data):
+        if not ADMIN_KEY or not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        cid = (data.get("id") or "").strip()
+        enabled = data.get("linkEnabled")
+        if not cid or enabled is None:
+            return self._send(400, {"error": "id and linkEnabled are required."})
+        conn = connect()
+        try:
+            row = one(q(conn, "SELECT * FROM coaches WHERE id = ?", (cid,)))
+            if not row:
+                return self._send(404, {"error": "Coach not found."})
+            val = 1 if enabled else 0
+            q(conn, "UPDATE coaches SET link_enabled = ?, updated_at = ? WHERE id = ?", (val, time.time(), cid))
+            conn.commit()
+            return self._send(200, {"ok": True, "coaches": list_coaches(conn)})
+        finally:
+            conn.close()
+
+    def _admin_mark_paid(self, data):
+        if not ADMIN_KEY or not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        oid = (data.get("id") or data.get("orderId") or "").strip()
+        if not oid:
+            return self._send(400, {"error": "Order id is required."})
+        conn = connect()
+        try:
+            row = load_order(conn, oid)
+            if not row:
+                return self._send(404, {"error": "Order not found."})
+            try:
+                payload = json.loads(g(row, "data_json") or "{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["status"] = "paid"
+            payload["paidAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            # Open coach offer if coach assigned
+            coach = payload.get("coach")
+            if coach and payload.get("offerStatus") not in ("accepted", "rejected", "done"):
+                payload["offerStatus"] = "offered"
+            save_order_data(conn, oid, payload, status="paid")
+            conn.commit()
+            # Notify coach if we can match
+            if coach and RESEND_API_KEY and not DEMO_EMAIL:
+                cemail = ""
+                cname = ""
+                if isinstance(coach, dict):
+                    cemail = (coach.get("email") or "").strip()
+                    cname = coach.get("displayName") or coach.get("name") or "Coach"
+                if cemail:
+                    # Prefer magic link from coaches table by email
+                    crow = one(q(conn, "SELECT * FROM coaches WHERE email = ?", (cemail.lower(),)))
+                    link = APP_PUBLIC_URL + "/biodrive-coach.html"
+                    if crow:
+                        link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + g(crow, "magic_token")
+                    html = "<p>Hi %s,</p><p>A BioDrive athlete request is ready for you (paid).</p><p><a href='%s'>Open your coach jobs</a></p>" % (cname, link)
+                    send_simple_email(cemail, "New BioDrive coaching request", html, "Open your jobs: " + link)
+            return self._send(200, {"ok": True, "orders": list_all_orders(conn)})
+        finally:
+            conn.close()
+
+    def _coach_respond(self, data, accept=True):
+        token = (data.get("key") or data.get("token") or "").strip()
+        oid = (data.get("orderId") or data.get("id") or "").strip()
+        if not token or not oid:
+            return self._send(400, {"error": "key and orderId are required."})
+        conn = connect()
+        try:
+            coach = coach_by_token(conn, token)
+            if not coach:
+                return self._send(401, {"error": "Invalid coach link."})
+            if not g(coach, "link_enabled"):
+                return self._send(403, {"error": "This coach link has been disabled."})
+            row = load_order(conn, oid)
+            if not row:
+                return self._send(404, {"error": "Job not found."})
+            try:
+                payload = json.loads(g(row, "data_json") or "{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            status = (g(row, "status") or "").lower()
+            if status == "pending_payment":
+                return self._send(403, {"error": "This request is not paid yet."})
+            # ownership check
+            cemail = (g(coach, "email") or "").lower()
+            coach_data = payload.get("coach") or {}
+            assigned_email = (coach_data.get("email") or "").lower() if isinstance(coach_data, dict) else ""
+            assigned_id = payload.get("coachId") or (coach_data.get("id") if isinstance(coach_data, dict) else None)
+            if assigned_id != g(coach, "id") and assigned_email != cemail:
+                return self._send(403, {"error": "This job is not assigned to you."})
+            if accept:
+                payload["offerStatus"] = "accepted"
+                payload["acceptedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            else:
+                payload["offerStatus"] = "rejected"
+                payload["rejectedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+                # Email admin only
+                if RESEND_API_KEY and not DEMO_EMAIL:
+                    race = payload.get("raceName") or "Race request"
+                    athlete = payload.get("email") or ""
+                    html = (
+                        "<p>A coach rejected a BioDrive offer.</p>"
+                        "<p><strong>Coach:</strong> %s (%s)</p>"
+                        "<p><strong>Race:</strong> %s</p>"
+                        "<p><strong>Athlete email:</strong> %s</p>"
+                        "<p><strong>Order:</strong> %s</p>"
+                        "<p>Please help the athlete find another coach.</p>"
+                    ) % (g(coach, "name"), g(coach, "email"), race, athlete, oid)
+                    send_simple_email(
+                        ADMIN_NOTIFY_EMAIL,
+                        "Coach rejected offer — " + race,
+                        html,
+                        "Coach %s rejected order %s (%s)" % (g(coach, "name"), oid, race),
+                    )
+            save_order_data(conn, oid, payload)
+            conn.commit()
+            return self._send(200, {"ok": True, "jobs": list_coach_jobs(conn, coach)})
+        finally:
+            conn.close()
 
     def _create_order(self, data):
         conn = connect()
