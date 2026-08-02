@@ -3,7 +3,7 @@
 from __future__ import annotations
 import hashlib, json, os, re, secrets, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 HOST = os.environ.get("BD_HOST") or os.environ.get("HOST") or "0.0.0.0"
 PORT = int(os.environ.get("BD_PORT") or os.environ.get("PORT") or "8787")
@@ -180,7 +180,11 @@ def set_json(conn, table, user_id, data):
 
 def send_verification_email(to_email, token):
     """Send verify link via Resend. Returns (ok, detail)."""
-    verify_url = APP_PUBLIC_URL + "/biodrive-verify.html?token=" + token + "&email=" + to_email
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    verify_url = APP_PUBLIC_URL + "/biodrive-verify.html?token=" + token + "&email=" + quote(to_email)
     subject = "Verify your BioDrive Cycling account"
     html = (
         "<p>Welcome to BioDrive Cycling.</p>"
@@ -192,10 +196,11 @@ def send_verification_email(to_email, token):
     ) % (verify_url, verify_url)
     text = "Verify your BioDrive account: " + verify_url
 
+    print("[email] preparing send to=%s from=%s" % (to_email, EMAIL_FROM), flush=True)
     if not RESEND_API_KEY:
+        print("[email] RESEND_API_KEY missing", flush=True)
         return False, "RESEND_API_KEY not set"
 
-    import urllib.request
     payload = json.dumps({
         "from": EMAIL_FROM,
         "to": [to_email],
@@ -208,26 +213,55 @@ def send_verification_email(to_email, token):
         data=payload,
         method="POST",
         headers={
-            "Authorization": "Bearer " + RESEND_API_KEY,
+            "Authorization": "Bearer " + RESEND_API_KEY.strip(),
             "Content-Type": "application/json",
         },
     )
     try:
-        with urllib.request.urlopen(req, timeout=20) as resp:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
             body = resp.read().decode("utf-8", errors="replace")
-            print("[email] sent to", to_email, "status", resp.status, body[:200])
+            print("[email] sent ok to", to_email, "status", resp.status, body[:300], flush=True)
             return True, body
-    except Exception as e:
-        # urllib HTTPError
-        detail = str(e)
+    except urllib.error.HTTPError as e:
         try:
-            if hasattr(e, "read"):
-                detail = e.read().decode("utf-8", errors="replace")
+            detail = e.read().decode("utf-8", errors="replace")
         except Exception:
-            pass
-        print("[email] FAILED to", to_email, detail)
-        return False, detail
+            detail = str(e)
+        print("[email] FAILED HTTP", e.code, "to", to_email, detail, flush=True)
+        return False, "HTTP %s: %s" % (e.code, detail)
+    except Exception as e:
+        print("[email] FAILED to", to_email, type(e).__name__, e, flush=True)
+        return False, "%s: %s" % (type(e).__name__, e)
 
+
+
+def check_resend_api():
+    """Call Resend API to validate key. Returns dict."""
+    import ssl, urllib.request, urllib.error
+    if not RESEND_API_KEY:
+        return {"ok": False, "error": "no key"}
+    req = urllib.request.Request(
+        "https://api.resend.com/domains",
+        method="GET",
+        headers={"Authorization": "Bearer " + RESEND_API_KEY.strip()},
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=20, context=ctx) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print("[email] resend domains ok", body[:200], flush=True)
+            return {"ok": True, "status": resp.status, "body": body[:500]}
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(e)
+        print("[email] resend domains FAILED", e.code, detail, flush=True)
+        return {"ok": False, "status": e.code, "error": detail}
+    except Exception as e:
+        print("[email] resend domains ERROR", type(e).__name__, e, flush=True)
+        return {"ok": False, "error": str(e)}
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "BioDriveAPI/2.2"
@@ -267,7 +301,10 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.2, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.3, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+        if path == "/api/email-status":
+            result = check_resend_api()
+            return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
         if path in ("/api/auth/me", "/api/profile", "/api/powers"):
             conn = connect()
             try:
@@ -353,7 +390,7 @@ class Handler(BaseHTTPRequestHandler):
             if not ok_send:
                 body["message"] = "Account created, but the verification email could not be sent. Please try resend or contact support."
                 body["emailError"] = True
-                print("[email] signup send failed:", detail)
+                print("[email] signup send failed:", detail, flush=True)
             else:
                 body["message"] = "Account created. Check your email for a verification link."
         else:
@@ -362,7 +399,7 @@ class Handler(BaseHTTPRequestHandler):
             body["verificationPath"] = "biodrive-verify.html?token=" + verify_token + "&email=" + email
             print("[demo-email] token for", email, verify_token)
             if not RESEND_API_KEY:
-                print("[email] RESEND_API_KEY not set — using demo verification link")
+                print("[email] RESEND_API_KEY not set — using demo verification link", flush=True)
         return self._send(201, body)
     def _login(self, data):
         email = (data.get("email") or "").strip().lower()
@@ -425,7 +462,7 @@ class Handler(BaseHTTPRequestHandler):
                 if RESEND_API_KEY and not DEMO_EMAIL:
                     ok_send, detail = send_verification_email(email, token)
                     if not ok_send:
-                        print("[email] resend failed:", detail)
+                        print("[email] resend failed:", detail, flush=True)
                 else:
                     body["verificationToken"] = token
                     body["verificationPath"] = "biodrive-verify.html?token=" + token + "&email=" + email
