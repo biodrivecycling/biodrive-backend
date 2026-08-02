@@ -465,8 +465,180 @@ def list_all_orders(conn):
         })
     return out
 
+
+def ensure_coaches_table(conn):
+    try:
+        q(conn, """CREATE TABLE IF NOT EXISTS coaches (
+              id TEXT PRIMARY KEY,
+              name TEXT NOT NULL,
+              email TEXT NOT NULL,
+              magic_token TEXT NOT NULL UNIQUE,
+              link_enabled INTEGER NOT NULL DEFAULT 1,
+              created_at DOUBLE PRECISION NOT NULL,
+              updated_at DOUBLE PRECISION NOT NULL)""")
+        conn.commit()
+    except Exception as e:
+        print("[db] ensure_coaches_table", e, flush=True)
+
+def send_simple_email(to_email, subject, html, text):
+    import ssl, urllib.error, urllib.request
+    print("[email] preparing simple to=%s subject=%s" % (to_email, subject), flush=True)
+    if not RESEND_API_KEY:
+        return False, "RESEND_API_KEY not set"
+    payload = json.dumps({
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": text,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + RESEND_API_KEY.strip(),
+            "Content-Type": "application/json",
+            "User-Agent": "BioDriveCycling/1.0",
+        },
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print("[email] simple sent ok", resp.status, body[:200], flush=True)
+            return True, body
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(e)
+        print("[email] simple FAILED", e.code, detail, flush=True)
+        return False, detail
+    except Exception as e:
+        print("[email] simple ERROR", e, flush=True)
+        return False, str(e)
+
+def coach_by_token(conn, token):
+    if not token:
+        return None
+    ensure_coaches_table(conn)
+    return one(q(conn, "SELECT * FROM coaches WHERE magic_token = ?", (token,)))
+
+def list_coaches(conn):
+    ensure_coaches_table(conn)
+    cur = q(conn, "SELECT * FROM coaches ORDER BY created_at DESC")
+    out = []
+    while True:
+        row = one(cur)
+        if not row:
+            break
+        out.append({
+            "id": g(row, "id"),
+            "name": g(row, "name"),
+            "email": g(row, "email"),
+            "magicToken": g(row, "magic_token"),
+            "linkEnabled": bool(g(row, "link_enabled")),
+            "magicLink": APP_PUBLIC_URL + "/biodrive-coach.html?key=" + g(row, "magic_token"),
+            "createdAt": g(row, "created_at"),
+        })
+    return out
+
+def order_row_to_coach_job(conn, row):
+    try:
+        data = json.loads(g(row, "data_json") or "{}")
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    uid = g(row, "user_id")
+    user = one(q(conn, "SELECT email, first_name, last_name FROM users WHERE id = ?", (uid,)))
+    profile = get_json(conn, "profiles", uid) or {}
+    athlete_email = (user and g(user, "email")) or data.get("email") or ""
+    first = (user and g(user, "first_name")) or profile.get("firstName") or ""
+    last = (user and g(user, "last_name")) or profile.get("lastName") or ""
+    offer = data.get("offerStatus") or None
+    status = g(row, "status") or data.get("status") or "pending_payment"
+    list_state = "new"
+    if offer == "accepted":
+        list_state = "ongoing"
+    elif offer == "rejected":
+        list_state = "rejected"
+    elif offer == "done":
+        list_state = "done"
+    return {
+        "id": g(row, "id"),
+        "status": status,
+        "offerStatus": offer,
+        "listState": list_state,
+        "raceName": data.get("raceName") or "",
+        "raceDate": data.get("raceDate") or "",
+        "raceTime": data.get("raceTime") or data.get("startTime") or "",
+        "eventAddress": data.get("eventAddress") or data.get("raceLocation") or "",
+        "services": data.get("services") or [],
+        "service": data.get("service") or "",
+        "estimatedTotal": data.get("estimatedTotal"),
+        "coach": data.get("coach"),
+        "athlete": {
+            "firstName": first,
+            "lastName": last,
+            "email": athlete_email,
+            "phone": profile.get("phone") or data.get("phone") or "",
+            "preferredContact": profile.get("preferredContact") or data.get("preferredContact") or "",
+        },
+        "createdAt": data.get("createdAt") or g(row, "created_at"),
+        "paidAt": data.get("paidAt"),
+        "serviceDescriptions": {
+            "2": "Rider guide plus a meeting with a coach before race day. From $300.",
+            "3": "Live rider guide plus coach support on race day. From $1000.",
+        },
+    }
+
+def list_coach_jobs(conn, coach):
+    cid = g(coach, "id")
+    cemail = (g(coach, "email") or "").strip().lower()
+    cname = (g(coach, "name") or "").strip().lower()
+    cur = q(conn, "SELECT * FROM strategy_orders ORDER BY created_at DESC")
+    out = []
+    while True:
+        row = one(cur)
+        if not row:
+            break
+        try:
+            data = json.loads(g(row, "data_json") or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        status = (g(row, "status") or data.get("status") or "").lower()
+        if status in ("pending_payment", "pending", ""):
+            continue
+        coach_data = data.get("coach") or {}
+        assigned_id = data.get("coachId") or (coach_data.get("id") if isinstance(coach_data, dict) else None)
+        assigned_email = ""
+        assigned_name = ""
+        if isinstance(coach_data, dict):
+            assigned_email = (coach_data.get("email") or "").strip().lower()
+            assigned_name = (coach_data.get("displayName") or coach_data.get("name") or "").strip().lower()
+        if assigned_id != cid and assigned_email != cemail and assigned_name != cname:
+            continue
+        out.append(order_row_to_coach_job(conn, row))
+    return out
+
+def load_order(conn, order_id):
+    return one(q(conn, "SELECT * FROM strategy_orders WHERE id = ?", (order_id,)))
+
+def save_order_data(conn, order_id, data, status=None):
+    now = time.time()
+    if status is not None:
+        q(conn, "UPDATE strategy_orders SET data_json = ?, status = ?, updated_at = ? WHERE id = ?",
+          (json.dumps(data), status, now, order_id))
+    else:
+        q(conn, "UPDATE strategy_orders SET data_json = ?, updated_at = ? WHERE id = ?",
+          (json.dumps(data), now, order_id))
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAPI/2.5"
+    server_version = "BioDriveAPI/2.8"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -511,7 +683,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.7, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.8, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
