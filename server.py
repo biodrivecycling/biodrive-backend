@@ -215,6 +215,7 @@ def send_verification_email(to_email, token):
         headers={
             "Authorization": "Bearer " + RESEND_API_KEY.strip(),
             "Content-Type": "application/json",
+            "User-Agent": "BioDriveCycling/1.0",
         },
     )
     try:
@@ -244,7 +245,7 @@ def check_resend_api():
     req = urllib.request.Request(
         "https://api.resend.com/domains",
         method="GET",
-        headers={"Authorization": "Bearer " + RESEND_API_KEY.strip()},
+        headers={"Authorization": "Bearer " + RESEND_API_KEY.strip(), "User-Agent": "BioDriveCycling/1.0"},
     )
     try:
         ctx = ssl.create_default_context()
