@@ -641,7 +641,7 @@ def save_order_data(conn, order_id, data, status=None):
           (json.dumps(data), now, order_id))
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAPI/2.9"
+    server_version = "BioDriveAPI/2.10"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -686,7 +686,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.9, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.10, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -785,6 +785,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/coaches": return self._admin_create_coach(data)
         if path == "/api/admin/coaches/toggle": return self._admin_toggle_coach(data)
         if path == "/api/admin/orders/mark-paid": return self._admin_mark_paid(data)
+        if path == "/api/admin/orders/attach-gpx": return self._admin_attach_gpx(data)
         if path == "/api/coach/accept": return self._coach_respond(data, accept=True)
         if path == "/api/coach/reject": return self._coach_respond(data, accept=False)
         return self._send(404, {"error": "Not found."})
@@ -964,6 +965,59 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(200, {"ok": True, "coaches": list_coaches(conn)})
         finally:
             conn.close()
+
+
+    def _admin_attach_gpx(self, data):
+        if not ADMIN_KEY or not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        oid = (data.get("id") or data.get("orderId") or "").strip()
+        if not oid:
+            return self._send(400, {"error": "Order id is required."})
+        gpx_name = (data.get("gpxName") or data.get("filename") or "course.gpx").strip() or "course.gpx"
+        gpx_text = data.get("gpxText") or data.get("gpx") or ""
+        gpx_url = (data.get("gpxUrl") or data.get("url") or "").strip()
+        note = (data.get("note") or "").strip()
+        if not gpx_text and not gpx_url:
+            return self._send(400, {"error": "Provide GPX file content (gpxText) or a gpxUrl link."})
+        # Soft size guard (~1.5MB text)
+        if gpx_text and len(gpx_text) > 1500000:
+            return self._send(400, {"error": "GPX file is too large (max ~1.5MB)."})
+        conn = connect()
+        try:
+            row = load_order(conn, oid)
+            if not row:
+                return self._send(404, {"error": "Order not found."})
+            try:
+                payload = json.loads(g(row, "data_json") or "{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            payload["gpxName"] = gpx_name
+            payload["courseDataSource"] = payload.get("courseDataSource") or "biodrive_obtain"
+            payload["courseDataStatus"] = "ready"
+            payload["courseDataAttachedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            payload["courseDataAttachedBy"] = "admin"
+            if gpx_url:
+                payload["gpxUrl"] = gpx_url
+            if gpx_text:
+                payload["gpxText"] = gpx_text
+            if note:
+                payload["courseDataNote"] = note
+            # Clear fee-pending ambiguity: data is now on file
+            payload["gpxFeeAcknowledged"] = bool(payload.get("gpxFeeAcknowledged") or payload.get("courseDataSource") == "biodrive_obtain")
+            save_order_data(conn, oid, payload)
+            conn.commit()
+            print("[admin] attached GPX to", oid, "name", gpx_name, "bytes", len(gpx_text or ""), flush=True)
+            return self._send(200, {"ok": True, "orderId": oid, "orders": list_all_orders(conn)})
+        except Exception as e:
+            print("[admin] attach-gpx", type(e).__name__, e, flush=True)
+            return self._send(500, {"error": "Could not attach GPX: %s: %s" % (type(e).__name__, e)})
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
 
     def _admin_mark_paid(self, data):
         if not ADMIN_KEY or not require_admin(self):
