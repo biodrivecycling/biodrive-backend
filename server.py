@@ -237,6 +237,64 @@ def send_verification_email(to_email, token):
 
 
 
+
+def send_password_reset_email(to_email, token):
+    """Send password reset link via Resend. Returns (ok, detail)."""
+    import ssl
+    import urllib.error
+    import urllib.request
+
+    reset_url = APP_PUBLIC_URL + "/biodrive-reset-password.html?token=" + token + "&email=" + quote(to_email)
+    subject = "Reset your BioDrive Cycling password"
+    html = (
+        "<p>We received a request to reset your BioDrive Cycling password.</p>"
+        "<p>Click the link below to choose a new password:</p>"
+        '<p><a href="%s">Reset my password</a></p>'
+        "<p>Or copy this URL:</p><p>%s</p>"
+        "<p>This link expires in 1 hour. If you did not request a reset, you can ignore this email.</p>"
+    ) % (reset_url, reset_url)
+    text = "Reset your BioDrive password: " + reset_url
+
+    print("[email] preparing password-reset to=%s from=%s" % (to_email, EMAIL_FROM), flush=True)
+    if not RESEND_API_KEY:
+        print("[email] RESEND_API_KEY missing", flush=True)
+        return False, "RESEND_API_KEY not set"
+
+    payload = json.dumps({
+        "from": EMAIL_FROM,
+        "to": [to_email],
+        "subject": subject,
+        "html": html,
+        "text": text,
+    }).encode("utf-8")
+    req = urllib.request.Request(
+        "https://api.resend.com/emails",
+        data=payload,
+        method="POST",
+        headers={
+            "Authorization": "Bearer " + RESEND_API_KEY.strip(),
+            "Content-Type": "application/json",
+            "User-Agent": "BioDriveCycling/1.0",
+        },
+    )
+    try:
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=30, context=ctx) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            print("[email] password-reset sent ok to", to_email, "status", resp.status, body[:300], flush=True)
+            return True, body
+    except urllib.error.HTTPError as e:
+        try:
+            detail = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            detail = str(e)
+        print("[email] password-reset FAILED HTTP", e.code, "to", to_email, detail, flush=True)
+        return False, "HTTP %s: %s" % (e.code, detail)
+    except Exception as e:
+        print("[email] password-reset FAILED to", to_email, type(e).__name__, e, flush=True)
+        return False, "%s: %s" % (type(e).__name__, e)
+
+
 def check_resend_api():
     """Call Resend API to validate key. Returns dict."""
     import ssl, urllib.request, urllib.error
@@ -265,7 +323,7 @@ def check_resend_api():
         return {"ok": False, "error": str(e)}
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAPI/2.2"
+    server_version = "BioDriveAPI/2.4"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -302,7 +360,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.3, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.4, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -330,6 +388,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/logout": return self._logout()
         if path == "/api/auth/verify": return self._verify(data)
         if path == "/api/auth/resend-verification": return self._resend(data)
+        if path == "/api/auth/forgot-password": return self._forgot_password(data)
+        if path == "/api/auth/reset-password": return self._reset_password(data)
         if path in ("/api/profile", "/api/powers"): return self._write(path, data)
         return self._send(404, {"error": "Not found."})
     def _write(self, path, data):
@@ -450,6 +510,82 @@ class Handler(BaseHTTPRequestHandler):
                                     "profile": get_json(conn, "profiles", uid), "powers": get_json(conn, "powers", uid)})
         finally:
             conn.close()
+
+    def _forgot_password(self, data):
+        # Always return the same message (do not reveal whether email exists)
+        email = (data.get("email") or "").strip().lower()
+        generic = {
+            "ok": True,
+            "message": "If an account exists for that email, a password reset link has been sent.",
+        }
+        if not email or not EMAIL_RE.match(email):
+            return self._send(400, {"error": "Please enter a valid email."})
+        conn = connect()
+        try:
+            user = one(q(conn, "SELECT * FROM users WHERE email = ?", (email,)))
+            if not user:
+                print("[email] forgot-password: no user for", email, flush=True)
+                return self._send(200, generic)
+            if not g(user, "email_verified"):
+                # Still send reset only for verified accounts; unverified can resend verify
+                print("[email] forgot-password: unverified user", email, flush=True)
+                return self._send(200, generic)
+            token = create_email_token(conn, g(user, "id"), "reset_password", hours=1)
+            conn.commit()
+            if RESEND_API_KEY and not DEMO_EMAIL:
+                ok_send, detail = send_password_reset_email(email, token)
+                if not ok_send:
+                    print("[email] forgot-password send failed:", detail, flush=True)
+                    return self._send(502, {"error": "Could not send reset email. Please try again later."})
+            else:
+                generic["resetToken"] = token
+                generic["resetPath"] = "biodrive-reset-password.html?token=" + token + "&email=" + email
+                print("[demo-email] reset token for", email, token, flush=True)
+            return self._send(200, generic)
+        finally:
+            conn.close()
+
+    def _reset_password(self, data):
+        token = (data.get("token") or "").strip()
+        password = data.get("password") or ""
+        if not token:
+            return self._send(400, {"error": "Reset token is required."})
+        err = strong_password(password)
+        if err:
+            return self._send(400, {"error": err})
+        now = time.time()
+        conn = connect()
+        try:
+            row = one(q(conn, "SELECT * FROM email_tokens WHERE token = ? AND purpose = ?", (token, "reset_password")))
+            if not row:
+                return self._send(400, {"error": "Invalid or expired reset link."})
+            if g(row, "used_at") is not None:
+                return self._send(400, {"error": "This reset link was already used."})
+            if g(row, "expires_at") < now:
+                return self._send(400, {"error": "This reset link has expired. Please request a new one."})
+            uid = g(row, "user_id")
+            user = one(q(conn, "SELECT * FROM users WHERE id = ?", (uid,)))
+            if not user:
+                return self._send(400, {"error": "Invalid reset link."})
+            pw_hash, salt = hash_password(password)
+            q(conn, "UPDATE users SET password_hash = ?, password_salt = ?, updated_at = ? WHERE id = ?",
+              (pw_hash, salt, now, uid))
+            q(conn, "UPDATE email_tokens SET used_at = ? WHERE token = ?", (now, token))
+            # Invalidate existing sessions for security
+            q(conn, "DELETE FROM sessions WHERE user_id = ?", (uid,))
+            session = create_session(conn, uid)
+            conn.commit()
+            return self._send(200, {
+                "ok": True,
+                "message": "Password updated.",
+                "token": session,
+                "user": user_public(user),
+                "profile": get_json(conn, "profiles", uid),
+                "powers": get_json(conn, "powers", uid),
+            })
+        finally:
+            conn.close()
+
     def _resend(self, data):
         email = (data.get("email") or "").strip().lower()
         if not email or not EMAIL_RE.match(email): return self._send(400, {"error": "Please enter a valid email."})
