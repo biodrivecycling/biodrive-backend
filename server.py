@@ -512,12 +512,7 @@ class Handler(BaseHTTPRequestHandler):
             conn.close()
 
     def _forgot_password(self, data):
-        # Always return the same message (do not reveal whether email exists)
         email = (data.get("email") or "").strip().lower()
-        generic = {
-            "ok": True,
-            "message": "If an account exists for that email, a password reset link has been sent.",
-        }
         if not email or not EMAIL_RE.match(email):
             return self._send(400, {"error": "Please enter a valid email."})
         conn = connect()
@@ -525,23 +520,35 @@ class Handler(BaseHTTPRequestHandler):
             user = one(q(conn, "SELECT * FROM users WHERE email = ?", (email,)))
             if not user:
                 print("[email] forgot-password: no user for", email, flush=True)
-                return self._send(200, generic)
+                return self._send(404, {
+                    "ok": False,
+                    "error": "We could not find an account with that email. Check the spelling or sign up.",
+                    "code": "NO_ACCOUNT",
+                })
             if not g(user, "email_verified"):
-                # Still send reset only for verified accounts; unverified can resend verify
                 print("[email] forgot-password: unverified user", email, flush=True)
-                return self._send(200, generic)
+                return self._send(403, {
+                    "ok": False,
+                    "error": "That account exists but the email is not verified yet. Please verify your email first (or sign up again).",
+                    "code": "EMAIL_NOT_VERIFIED",
+                })
             token = create_email_token(conn, g(user, "id"), "reset_password", hours=1)
             conn.commit()
+            body = {
+                "ok": True,
+                "exists": True,
+                "message": "We found your account. A password reset link is on its way to " + email + ". Check your inbox and spam folder.",
+            }
             if RESEND_API_KEY and not DEMO_EMAIL:
                 ok_send, detail = send_password_reset_email(email, token)
                 if not ok_send:
                     print("[email] forgot-password send failed:", detail, flush=True)
-                    return self._send(502, {"error": "Could not send reset email. Please try again later."})
+                    return self._send(502, {"error": "We found your account, but the reset email could not be sent. Please try again in a moment."})
             else:
-                generic["resetToken"] = token
-                generic["resetPath"] = "biodrive-reset-password.html?token=" + token + "&email=" + email
+                body["resetToken"] = token
+                body["resetPath"] = "biodrive-reset-password.html?token=" + token + "&email=" + email
                 print("[demo-email] reset token for", email, token, flush=True)
-            return self._send(200, generic)
+            return self._send(200, body)
         finally:
             conn.close()
 
