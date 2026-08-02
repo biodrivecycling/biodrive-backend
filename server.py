@@ -457,15 +457,23 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
-        origin = self.headers.get("Origin", "")
+        origin = self.headers.get("Origin", "") or ""
         allow = None
-        if origin in CORS_ORIGINS or origin == "null": allow = origin or "*"
-        elif origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1"): allow = origin
-        elif not origin: allow = "*"
+        if origin in CORS_ORIGINS or origin == "null":
+            allow = origin or "*"
+        elif origin.startswith("http://localhost") or origin.startswith("http://127.0.0.1"):
+            allow = origin
+        elif origin.endswith("biodrivecycling.com") or origin.endswith(".netlify.app"):
+            allow = origin
+        elif not origin:
+            allow = "*"
+        else:
+            # Still reflect known public site if env list is incomplete
+            allow = origin if "biodrive" in origin.lower() else None
         if allow:
             self.send_header("Access-Control-Allow-Origin", allow)
             self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key, X-Coach-Key")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Vary", "Origin")
     def _read_json(self):
