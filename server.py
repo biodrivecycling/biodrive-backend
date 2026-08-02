@@ -383,7 +383,13 @@ def require_admin(handler):
         auth = handler.headers.get("Authorization") or ""
         if auth.lower().startswith("bearer "):
             key = auth[7:].strip()
-    return bool(key) and secrets.compare_digest(key, ADMIN_KEY)
+    if not key:
+        return False
+    # compare_digest raises if lengths differ — treat as invalid key
+    try:
+        return secrets.compare_digest(key, ADMIN_KEY)
+    except Exception:
+        return False
 
 def list_all_users(conn):
     cur = q(conn, "SELECT id, email, first_name, last_name, email_verified, created_at, updated_at FROM users ORDER BY created_at DESC")
