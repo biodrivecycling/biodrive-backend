@@ -587,7 +587,9 @@ def order_row_to_coach_job(conn, row):
             "lastName": last,
             "email": athlete_email,
             "phone": profile.get("phone") or data.get("phone") or "",
-            "preferredContact": profile.get("preferredContact") or data.get("preferredContact") or "",
+            "preferredContact": profile.get("primaryContact") or profile.get("preferredContact") or data.get("preferredContact") or "",
+            "primaryContact": profile.get("primaryContact") or profile.get("preferredContact") or data.get("primaryContact") or data.get("preferredContact") or "",
+            "secondaryContact": profile.get("secondaryContact") or data.get("secondaryContact") or "",
         },
         "createdAt": data.get("createdAt") or g(row, "created_at"),
         "paidAt": data.get("paidAt"),
@@ -615,6 +617,9 @@ def list_coach_jobs(conn, coach):
             data = {}
         status = (g(row, "status") or data.get("status") or "").lower()
         if status in ("pending_payment", "pending", ""):
+            continue
+        # Rejected offers leave the coach inbox
+        if (data.get("offerStatus") or "").lower() == "rejected":
             continue
         coach_data = data.get("coach") or {}
         assigned_id = data.get("coachId") or (coach_data.get("id") if isinstance(coach_data, dict) else None)
@@ -686,7 +691,7 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.11, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.13, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -782,6 +787,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/reset-password": return self._reset_password(data)
         if path in ("/api/profile", "/api/powers"): return self._write(path, data)
         if path == "/api/orders": return self._create_order(data)
+        if path == "/api/orders/reassign-coach": return self._reassign_coach(data)
         if path == "/api/admin/coaches": return self._admin_create_coach(data)
         if path == "/api/admin/coaches/toggle": return self._admin_toggle_coach(data)
         if path == "/api/admin/orders/mark-paid": return self._admin_mark_paid(data)
@@ -1124,6 +1130,124 @@ class Handler(BaseHTTPRequestHandler):
             save_order_data(conn, oid, payload)
             conn.commit()
             return self._send(200, {"ok": True, "jobs": list_coach_jobs(conn, coach)})
+        finally:
+            conn.close()
+
+
+    def _reassign_coach(self, data):
+        """Athlete picks a new coach after a rejection (Pathway 2)."""
+        conn = connect()
+        try:
+            user = session_user(conn, self._bearer())
+            if not user:
+                return self._send(401, {"error": "Not authenticated."})
+            uid = g(user, "id")
+            oid = (data.get("orderId") or data.get("id") or "").strip()
+            coach_in = data.get("coach") or {}
+            if not oid:
+                return self._send(400, {"error": "orderId is required."})
+            if not isinstance(coach_in, dict) or not (coach_in.get("id") or coach_in.get("displayName") or coach_in.get("name")):
+                return self._send(400, {"error": "A coach selection is required."})
+            row = load_order(conn, oid)
+            if not row:
+                return self._send(404, {"error": "Request not found."})
+            if g(row, "user_id") != uid:
+                return self._send(403, {"error": "Not your request."})
+            try:
+                payload = json.loads(g(row, "data_json") or "{}")
+            except Exception:
+                payload = {}
+            if not isinstance(payload, dict):
+                payload = {}
+            status = (g(row, "status") or payload.get("status") or "").lower()
+            offer = (payload.get("offerStatus") or "").lower()
+            if status == "pending_payment":
+                return self._send(400, {"error": "This request is not paid yet."})
+            if offer == "offered":
+                return self._send(400, {"error": "This offer is still waiting on the current coach. Reassign after a rejection."})
+            if offer == "accepted":
+                return self._send(400, {"error": "A coach already accepted. Contact BioDrive to change coaches."})
+            if offer not in ("rejected", "needs_reassignment"):
+                return self._send(400, {"error": "Reassignment is only available after a coach rejects the offer."})
+            prev = payload.get("coach") or {}
+            prev_name = ""
+            if isinstance(prev, dict):
+                prev_name = prev.get("displayName") or prev.get("name") or ""
+            # Normalize coach snapshot
+            snap = {
+                "id": coach_in.get("id") or "",
+                "slug": coach_in.get("slug") or "",
+                "displayName": coach_in.get("displayName") or coach_in.get("name") or "",
+                "name": coach_in.get("displayName") or coach_in.get("name") or "",
+                "email": coach_in.get("email") or "",
+                "hourlyRate": coach_in.get("hourlyRate") or (coach_in.get("pricing") or {}).get("hourlyRate") if isinstance(coach_in.get("pricing"), dict) else coach_in.get("hourlyRate"),
+                "rateLabel": coach_in.get("rateLabel") or "",
+                "region": coach_in.get("region") or "",
+                "remote": bool(coach_in.get("remote")),
+                "inPerson": bool(coach_in.get("inPerson")),
+                "specialties": coach_in.get("specialties") if isinstance(coach_in.get("specialties"), list) else [],
+                "timezone": coach_in.get("timezone") or "",
+            }
+            payload["previousCoach"] = prev
+            payload["coach"] = snap
+            payload["coachId"] = snap.get("id") or ""
+            payload["offerStatus"] = "offered"
+            payload["reassignedAt"] = __import__("datetime").datetime.utcnow().isoformat() + "Z"
+            payload.pop("rejectedAt", None)
+            save_order_data(conn, oid, payload)
+            conn.commit()
+            # Notify admin of reassignment
+            if RESEND_API_KEY and not DEMO_EMAIL:
+                race = payload.get("raceName") or "Race request"
+                athlete = g(user, "email") or payload.get("email") or ""
+                html = (
+                    "<p>An athlete reassigned their coach after a rejection.</p>"
+                    "<p><strong>Race:</strong> %s</p>"
+                    "<p><strong>Athlete:</strong> %s</p>"
+                    "<p><strong>Previous coach:</strong> %s</p>"
+                    "<p><strong>New coach:</strong> %s</p>"
+                    "<p><strong>Order:</strong> %s</p>"
+                ) % (race, athlete, prev_name or "—", snap.get("displayName") or "—", oid)
+                try:
+                    send_simple_email(
+                        ADMIN_NOTIFY_EMAIL,
+                        "Coach reassigned — " + race,
+                        html,
+                        "Athlete %s reassigned order %s from %s to %s" % (athlete, oid, prev_name, snap.get("displayName")),
+                    )
+                except Exception as e:
+                    print("[email] reassign notify", e, flush=True)
+            # Notify new coach if we can resolve magic link by name/email
+            if RESEND_API_KEY and not DEMO_EMAIL:
+                cemail = (snap.get("email") or "").strip().lower()
+                crow = None
+                if cemail:
+                    crow = one(q(conn, "SELECT * FROM coaches WHERE email = ?", (cemail,)))
+                if not crow and snap.get("displayName"):
+                    crow = None
+                    try:
+                        curc = q(conn, "SELECT * FROM coaches")
+                        target = (snap.get("displayName") or "").strip().lower()
+                        while True:
+                            r = one(curc)
+                            if not r: break
+                            if (g(r, "name") or "").strip().lower() == target:
+                                crow = r
+                                break
+                    except Exception:
+                        crow = None
+                if crow and g(crow, "email"):
+                    link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + g(crow, "magic_token")
+                    try:
+                        send_simple_email(
+                            g(crow, "email"),
+                            "New BioDrive coaching request",
+                            "<p>Hi %s,</p><p>A paid athlete request was assigned to you.</p><p><a href='%s'>Open your coach jobs</a></p>" % (g(crow, "name"), link),
+                            "Open your jobs: " + link,
+                        )
+                    except Exception as e:
+                        print("[email] new coach notify", e, flush=True)
+            return self._send(200, {"ok": True, "orders": list_orders(conn, uid)})
         finally:
             conn.close()
 
