@@ -745,21 +745,28 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "Name and valid email are required."})
         conn = connect()
         try:
-            cid = "coach_" + secrets.token_hex(8)
-            token = secrets.token_urlsafe(32)
-            now = time.time()
-            q(conn, "INSERT INTO coaches (id, name, email, magic_token, link_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-              (cid, name, email, token, 1, now, now))
-            conn.commit()
-            link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + token
-            # Optional onboard email
-            if RESEND_API_KEY and not DEMO_EMAIL:
-                html = "<p>Hi %s,</p><p>Your BioDrive coach access link:</p><p><a href='%s'>%s</a></p><p>Keep this link private. BioDrive admin can disable it at any time.</p>" % (name, link, link)
-                send_simple_email(email, "Your BioDrive coach access", html, "Your BioDrive coach link: " + link)
-            return self._send(201, {"ok": True, "coach": {
-                "id": cid, "name": name, "email": email, "magicToken": token,
-                "linkEnabled": True, "magicLink": link,
-            }, "coaches": list_coaches(conn)})
+            try:
+                ensure_coaches_table(conn)
+                cid = "coach_" + secrets.token_hex(8)
+                token = secrets.token_urlsafe(32)
+                now = time.time()
+                q(conn, "INSERT INTO coaches (id, name, email, magic_token, link_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                  (cid, name, email, token, 1, now, now))
+                conn.commit()
+                link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + token
+                if RESEND_API_KEY and not DEMO_EMAIL:
+                    html = "<p>Hi %s,</p><p>Your BioDrive coach access link:</p><p><a href='%s'>%s</a></p><p>Keep this link private. BioDrive admin can disable it at any time.</p>" % (name, link, link)
+                    try:
+                        send_simple_email(email, "Your BioDrive coach access", html, "Your BioDrive coach link: " + link)
+                    except Exception as ee:
+                        print("[email] coach onboard", ee, flush=True)
+                return self._send(201, {"ok": True, "coach": {
+                    "id": cid, "name": name, "email": email, "magicToken": token,
+                    "linkEnabled": True, "magicLink": link,
+                }, "coaches": list_coaches(conn)})
+            except Exception as e:
+                print("[admin] create coach", type(e).__name__, e, flush=True)
+                return self._send(500, {"error": "Could not create coach: %s: %s" % (type(e).__name__, e)})
         finally:
             conn.close()
 
@@ -772,6 +779,7 @@ class Handler(BaseHTTPRequestHandler):
             return self._send(400, {"error": "id and linkEnabled are required."})
         conn = connect()
         try:
+            ensure_coaches_table(conn)
             row = one(q(conn, "SELECT * FROM coaches WHERE id = ?", (cid,)))
             if not row:
                 return self._send(404, {"error": "Coach not found."})
