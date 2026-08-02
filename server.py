@@ -461,6 +461,9 @@ def list_all_orders(conn):
             "coach": data.get("coach"),
             "email": data.get("email") or athlete.get("email") or "",
             "offerStatus": data.get("offerStatus") or None,
+            "courseDataSource": data.get("courseDataSource") or "",
+            "gpxObtainFee": data.get("gpxObtainFee") or 0,
+            "gpxName": data.get("gpxName") or "",
             "data": data,
         })
     return out
