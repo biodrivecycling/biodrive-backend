@@ -384,8 +384,15 @@ def require_admin(handler):
         if auth.lower().startswith("bearer "):
             key = auth[7:].strip()
     if not key:
+        # Allow ?key= for simple browser testing (and some proxies)
+        try:
+            from urllib.parse import parse_qs
+            qs = parse_qs(urlparse(handler.path).query)
+            key = (qs.get("key") or [""])[0].strip()
+        except Exception:
+            key = ""
+    if not key:
         return False
-    # compare_digest raises if lengths differ — treat as invalid key
     try:
         return secrets.compare_digest(key, ADMIN_KEY)
     except Exception:
@@ -532,29 +539,37 @@ class Handler(BaseHTTPRequestHandler):
                 return self._send(401, {"error": "Invalid or missing admin key."})
             conn = connect()
             try:
-                if path == "/api/admin/users":
-                    return self._send(200, {"users": list_all_users(conn)})
-                if path == "/api/admin/orders":
-                    return self._send(200, {"orders": list_all_orders(conn)})
-                if path == "/api/admin/coaches":
-                    return self._send(200, {"coaches": list_coaches(conn)})
-                users = list_all_users(conn)
-                orders = list_all_orders(conn)
-                coaches = list_coaches(conn)
-                pending_payment = sum(1 for o in orders if (o.get("status") or "").startswith("pending_payment"))
-                pending_offers = sum(1 for o in orders if (o.get("offerStatus") or "") in ("offered", "pending"))
-                return self._send(200, {
-                    "summary": {
-                        "userCount": len(users),
-                        "orderCount": len(orders),
-                        "pendingPaymentCount": pending_payment,
-                        "pendingOfferCount": pending_offers,
-                        "coachCount": len(coaches),
-                    },
-                    "users": users,
-                    "orders": orders,
-                    "coaches": coaches,
-                })
+                try:
+                    if path == "/api/admin/users":
+                        return self._send(200, {"users": list_all_users(conn)})
+                    if path == "/api/admin/orders":
+                        return self._send(200, {"orders": list_all_orders(conn)})
+                    if path == "/api/admin/coaches":
+                        return self._send(200, {"coaches": list_coaches(conn)})
+                    users = list_all_users(conn)
+                    orders = list_all_orders(conn)
+                    try:
+                        coaches = list_coaches(conn)
+                    except Exception as ce:
+                        print("[admin] list_coaches error", ce, flush=True)
+                        coaches = []
+                    pending_payment = sum(1 for o in orders if (o.get("status") or "").startswith("pending_payment"))
+                    pending_offers = sum(1 for o in orders if (o.get("offerStatus") or "") in ("offered", "pending"))
+                    return self._send(200, {
+                        "summary": {
+                            "userCount": len(users),
+                            "orderCount": len(orders),
+                            "pendingPaymentCount": pending_payment,
+                            "pendingOfferCount": pending_offers,
+                            "coachCount": len(coaches),
+                        },
+                        "users": users,
+                        "orders": orders,
+                        "coaches": coaches,
+                    })
+                except Exception as e:
+                    print("[admin] error", type(e).__name__, e, flush=True)
+                    return self._send(500, {"error": "Admin error: %s: %s" % (type(e).__name__, e)})
             finally:
                 conn.close()
         if path == "/api/coach/jobs":
