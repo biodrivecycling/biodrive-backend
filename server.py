@@ -14,6 +14,8 @@ DEMO_EMAIL = os.environ.get("BD_DEMO_EMAIL", "1") == "1"
 RESEND_API_KEY = (os.environ.get("RESEND_API_KEY") or "").strip()
 EMAIL_FROM = (os.environ.get("EMAIL_FROM") or "BioDrive Cycling <onboarding@resend.dev>").strip()
 APP_PUBLIC_URL = (os.environ.get("APP_PUBLIC_URL") or "https://biodrivecycling.com").rstrip("/")
+ADMIN_KEY = (os.environ.get("BD_ADMIN_KEY") or "").strip()
+ADMIN_NOTIFY_EMAIL = (os.environ.get("BD_ADMIN_NOTIFY_EMAIL") or "founders@biodrivecycling.com").strip()
 SESSION_DAYS = int(os.environ.get("BD_SESSION_DAYS", "30"))
 EMAIL_RE = re.compile(r"^[^\s@]+@[^\s@]+\.[^\s@]+$")
 USE_PG = bool(DATABASE_URL)
@@ -83,6 +85,13 @@ def init_db():
             CREATE TABLE IF NOT EXISTS powers (
               user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
               data_json TEXT NOT NULL DEFAULT '{}', updated_at DOUBLE PRECISION NOT NULL);
+            CREATE TABLE IF NOT EXISTS strategy_orders (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              status TEXT NOT NULL DEFAULT 'pending_payment',
+              data_json TEXT NOT NULL DEFAULT '{}',
+              created_at DOUBLE PRECISION NOT NULL,
+              updated_at DOUBLE PRECISION NOT NULL);
             """
             cur = conn.cursor()
             cur.execute(ddl)
@@ -106,6 +115,13 @@ def init_db():
             CREATE TABLE IF NOT EXISTS powers (
               user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
               data_json TEXT NOT NULL DEFAULT '{}', updated_at REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS strategy_orders (
+              id TEXT PRIMARY KEY,
+              user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+              status TEXT NOT NULL DEFAULT 'pending_payment',
+              data_json TEXT NOT NULL DEFAULT '{}',
+              created_at REAL NOT NULL,
+              updated_at REAL NOT NULL);
             """)
             conn.commit()
         print("DB ready:", "postgres/pg8000" if USE_PG else DB_PATH)
@@ -322,8 +338,122 @@ def check_resend_api():
         print("[email] resend domains ERROR", type(e).__name__, e, flush=True)
         return {"ok": False, "error": str(e)}
 
+
+def list_orders(conn, user_id):
+    cur = q(conn, "SELECT id, status, data_json, created_at, updated_at FROM strategy_orders WHERE user_id = ? ORDER BY created_at DESC", (user_id,))
+    out = []
+    while True:
+        row = one(cur)
+        if not row:
+            break
+        try:
+            data = json.loads(g(row, "data_json") or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        data["id"] = g(row, "id")
+        data["status"] = g(row, "status") or data.get("status") or "pending_payment"
+        ca = g(row, "created_at")
+        if ca is not None and not data.get("createdAt"):
+            try:
+                data["createdAt"] = __import__("datetime").datetime.utcfromtimestamp(float(ca)).isoformat() + "Z"
+            except Exception:
+                data["createdAt"] = ca
+        data["updatedAt"] = g(row, "updated_at")
+        out.append(data)
+    return out
+
+def insert_order(conn, user_id, status, data):
+    oid = "ord_" + secrets.token_hex(12)
+    now = time.time()
+    payload = dict(data) if isinstance(data, dict) else {}
+    payload["id"] = oid
+    payload["status"] = status
+    q(conn, "INSERT INTO strategy_orders (id, user_id, status, data_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+      (oid, user_id, status, json.dumps(payload), now, now))
+    return oid, payload
+
+
+def require_admin(handler):
+    if not ADMIN_KEY:
+        return False
+    key = (handler.headers.get("X-Admin-Key") or "").strip()
+    if not key:
+        auth = handler.headers.get("Authorization") or ""
+        if auth.lower().startswith("bearer "):
+            key = auth[7:].strip()
+    return bool(key) and secrets.compare_digest(key, ADMIN_KEY)
+
+def list_all_users(conn):
+    cur = q(conn, "SELECT id, email, first_name, last_name, email_verified, created_at, updated_at FROM users ORDER BY created_at DESC")
+    out = []
+    while True:
+        row = one(cur)
+        if not row:
+            break
+        out.append({
+            "id": g(row, "id"),
+            "email": g(row, "email"),
+            "firstName": g(row, "first_name"),
+            "lastName": g(row, "last_name"),
+            "emailVerified": bool(g(row, "email_verified")),
+            "createdAt": g(row, "created_at"),
+            "updatedAt": g(row, "updated_at"),
+        })
+    return out
+
+def list_all_orders(conn):
+    cur = q(conn, "SELECT id, user_id, status, data_json, created_at, updated_at FROM strategy_orders ORDER BY created_at DESC")
+    out = []
+    while True:
+        row = one(cur)
+        if not row:
+            break
+        try:
+            data = json.loads(g(row, "data_json") or "{}")
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        uid = g(row, "user_id")
+        user = one(q(conn, "SELECT email, first_name, last_name FROM users WHERE id = ?", (uid,)))
+        athlete = {}
+        if user:
+            athlete = {
+                "email": g(user, "email"),
+                "firstName": g(user, "first_name"),
+                "lastName": g(user, "last_name"),
+            }
+        ca = g(row, "created_at")
+        created_iso = data.get("createdAt")
+        if ca is not None and not created_iso:
+            try:
+                created_iso = __import__("datetime").datetime.utcfromtimestamp(float(ca)).isoformat() + "Z"
+            except Exception:
+                created_iso = ca
+        out.append({
+            "id": g(row, "id"),
+            "userId": uid,
+            "status": g(row, "status") or data.get("status") or "pending_payment",
+            "createdAt": created_iso,
+            "updatedAt": g(row, "updated_at"),
+            "athlete": athlete,
+            "raceName": data.get("raceName") or "",
+            "raceDate": data.get("raceDate") or "",
+            "eventAddress": data.get("eventAddress") or data.get("raceLocation") or "",
+            "services": data.get("services") or [],
+            "service": data.get("service") or "",
+            "estimatedTotal": data.get("estimatedTotal"),
+            "coach": data.get("coach"),
+            "email": data.get("email") or athlete.get("email") or "",
+            "offerStatus": data.get("offerStatus") or None,
+            "data": data,
+        })
+    return out
+
 class Handler(BaseHTTPRequestHandler):
-    server_version = "BioDriveAPI/2.4"
+    server_version = "BioDriveAPI/2.5"
     def log_message(self, fmt, *args):
         print("[%s] %s" % (self.log_date_time_string(), fmt % args))
     def _cors(self):
@@ -335,7 +465,7 @@ class Handler(BaseHTTPRequestHandler):
         if allow:
             self.send_header("Access-Control-Allow-Origin", allow)
             self.send_header("Access-Control-Allow-Credentials", "true")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Vary", "Origin")
     def _read_json(self):
@@ -360,21 +490,52 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = urlparse(self.path).path
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.4, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.5, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
-        if path in ("/api/auth/me", "/api/profile", "/api/powers"):
+        if path in ("/api/auth/me", "/api/profile", "/api/powers", "/api/orders"):
             conn = connect()
             try:
                 user = session_user(conn, self._bearer())
                 if not user: return self._send(401, {"error": "Not authenticated."})
                 uid = g(user, "id")
                 if path == "/api/auth/me":
-                    return self._send(200, {"user": user_public(user), "profile": get_json(conn, "profiles", uid), "powers": get_json(conn, "powers", uid)})
+                    return self._send(200, {"user": user_public(user), "profile": get_json(conn, "profiles", uid), "powers": get_json(conn, "powers", uid), "orders": list_orders(conn, uid)})
                 if path == "/api/profile":
                     return self._send(200, {"profile": get_json(conn, "profiles", uid)})
-                return self._send(200, {"powers": get_json(conn, "powers", uid)})
+                if path == "/api/powers":
+                    return self._send(200, {"powers": get_json(conn, "powers", uid)})
+                if path == "/api/orders":
+                    return self._send(200, {"orders": list_orders(conn, uid)})
+                return self._send(404, {"error": "Not found."})
+            finally:
+                conn.close()
+        if path in ("/api/admin/users", "/api/admin/orders", "/api/admin/summary"):
+            if not ADMIN_KEY:
+                return self._send(503, {"error": "Admin is not configured. Set BD_ADMIN_KEY on the server."})
+            if not require_admin(self):
+                return self._send(401, {"error": "Invalid or missing admin key."})
+            conn = connect()
+            try:
+                if path == "/api/admin/users":
+                    return self._send(200, {"users": list_all_users(conn)})
+                if path == "/api/admin/orders":
+                    return self._send(200, {"orders": list_all_orders(conn)})
+                users = list_all_users(conn)
+                orders = list_all_orders(conn)
+                pending_payment = sum(1 for o in orders if (o.get("status") or "").startswith("pending_payment"))
+                pending_offers = sum(1 for o in orders if (o.get("offerStatus") or "") in ("offered", "pending"))
+                return self._send(200, {
+                    "summary": {
+                        "userCount": len(users),
+                        "orderCount": len(orders),
+                        "pendingPaymentCount": pending_payment,
+                        "pendingOfferCount": pending_offers,
+                    },
+                    "users": users,
+                    "orders": orders,
+                })
             finally:
                 conn.close()
         return self._send(404, {"error": "Not found."})
@@ -391,6 +552,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/auth/forgot-password": return self._forgot_password(data)
         if path == "/api/auth/reset-password": return self._reset_password(data)
         if path in ("/api/profile", "/api/powers"): return self._write(path, data)
+        if path == "/api/orders": return self._create_order(data)
         return self._send(404, {"error": "Not found."})
     def _write(self, path, data):
         conn = connect()
@@ -508,6 +670,33 @@ class Handler(BaseHTTPRequestHandler):
             conn.commit()
             return self._send(200, {"ok": True, "message": "Email verified.", "token": session, "user": user_public(user),
                                     "profile": get_json(conn, "profiles", uid), "powers": get_json(conn, "powers", uid)})
+        finally:
+            conn.close()
+
+
+    def _create_order(self, data):
+        conn = connect()
+        try:
+            user = session_user(conn, self._bearer())
+            if not user:
+                return self._send(401, {"error": "Not authenticated."})
+            uid = g(user, "id")
+            order_data = data.get("order") if isinstance(data.get("order"), dict) else data
+            if not isinstance(order_data, dict):
+                return self._send(400, {"error": "Order must be a JSON object."})
+            # Strip client id/status if any; server owns them for new rows
+            order_data = dict(order_data)
+            order_data.pop("id", None)
+            status = (order_data.get("status") or "pending_payment").strip() or "pending_payment"
+            # No real payment yet — normalize paid-looking statuses
+            if status in ("paid", "complete", "completed"):
+                status = "pending_payment"
+            if status not in ("pending_payment", "pending_review", "in_progress", "delivered", "cancelled"):
+                status = "pending_payment"
+            oid, payload = insert_order(conn, uid, status, order_data)
+            conn.commit()
+            print("[order] created", oid, "user", uid, "status", status, flush=True)
+            return self._send(201, {"ok": True, "order": payload, "orders": list_orders(conn, uid)})
         finally:
             conn.close()
 
