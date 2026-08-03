@@ -477,11 +477,17 @@ def ensure_coaches_table(conn):
               email TEXT NOT NULL,
               magic_token TEXT NOT NULL UNIQUE,
               link_enabled INTEGER NOT NULL DEFAULT 1,
+              booking_url TEXT,
               created_at DOUBLE PRECISION NOT NULL,
               updated_at DOUBLE PRECISION NOT NULL)""")
         conn.commit()
     except Exception as e:
         print("[db] ensure_coaches_table", e, flush=True)
+    try:
+        q(conn, "ALTER TABLE coaches ADD COLUMN booking_url TEXT")
+        conn.commit()
+    except Exception:
+        pass  # column already exists
 
 def send_simple_email(to_email, subject, html, text):
     import ssl, urllib.error, urllib.request
@@ -543,6 +549,7 @@ def list_coaches(conn):
             "magicToken": g(row, "magic_token"),
             "linkEnabled": bool(g(row, "link_enabled")),
             "magicLink": APP_PUBLIC_URL + "/biodrive-coach.html?key=" + g(row, "magic_token"),
+            "bookingUrl": g(row, "booking_url") or "",
             "createdAt": g(row, "created_at"),
         })
     return out
@@ -690,8 +697,23 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self._cors(); self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/coaches/booking-links":
+            conn = connect()
+            try:
+                ensure_coaches_table(conn)
+                cur = q(conn, "SELECT name, email, booking_url FROM coaches WHERE link_enabled = 1")
+                out = []
+                while True:
+                    row = one(cur)
+                    if not row: break
+                    bu = (g(row, "booking_url") or "").strip()
+                    if not bu: continue
+                    out.append({"name": g(row, "name") or "", "email": g(row, "email") or "", "bookingUrl": bu})
+                return self._send(200, {"coaches": out})
+            finally:
+                conn.close()
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.13, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.14, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -790,6 +812,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/orders/reassign-coach": return self._reassign_coach(data)
         if path == "/api/admin/coaches": return self._admin_create_coach(data)
         if path == "/api/admin/coaches/toggle": return self._admin_toggle_coach(data)
+        if path == "/api/admin/coaches/booking-url": return self._admin_set_booking_url(data)
         if path == "/api/admin/orders/mark-paid": return self._admin_mark_paid(data)
         if path == "/api/admin/orders/attach-gpx": return self._admin_attach_gpx(data)
         if path == "/api/coach/accept": return self._coach_respond(data, accept=True)
@@ -932,8 +955,9 @@ class Handler(BaseHTTPRequestHandler):
                 cid = "coach_" + secrets.token_hex(8)
                 token = secrets.token_urlsafe(32)
                 now = time.time()
-                q(conn, "INSERT INTO coaches (id, name, email, magic_token, link_enabled, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                  (cid, name, email, token, 1, now, now))
+                booking_url = (data.get("bookingUrl") or data.get("booking_url") or "").strip()
+                q(conn, "INSERT INTO coaches (id, name, email, magic_token, link_enabled, booking_url, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                  (cid, name, email, token, 1, booking_url or None, now, now))
                 conn.commit()
                 link = APP_PUBLIC_URL + "/biodrive-coach.html?key=" + token
                 if RESEND_API_KEY and not DEMO_EMAIL:
@@ -944,11 +968,32 @@ class Handler(BaseHTTPRequestHandler):
                         print("[email] coach onboard", ee, flush=True)
                 return self._send(201, {"ok": True, "coach": {
                     "id": cid, "name": name, "email": email, "magicToken": token,
-                    "linkEnabled": True, "magicLink": link,
+                    "linkEnabled": True, "magicLink": link, "bookingUrl": booking_url or "",
                 }, "coaches": list_coaches(conn)})
             except Exception as e:
                 print("[admin] create coach", type(e).__name__, e, flush=True)
                 return self._send(500, {"error": "Could not create coach: %s: %s" % (type(e).__name__, e)})
+        finally:
+            conn.close()
+
+
+    def _admin_set_booking_url(self, data):
+        if not ADMIN_KEY or not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        cid = (data.get("id") or "").strip()
+        booking_url = (data.get("bookingUrl") or data.get("booking_url") or "").strip()
+        if not cid:
+            return self._send(400, {"error": "Coach id is required."})
+        conn = connect()
+        try:
+            ensure_coaches_table(conn)
+            row = one(q(conn, "SELECT * FROM coaches WHERE id = ?", (cid,)))
+            if not row:
+                return self._send(404, {"error": "Coach not found."})
+            q(conn, "UPDATE coaches SET booking_url = ?, updated_at = ? WHERE id = ?",
+              (booking_url or None, time.time(), cid))
+            conn.commit()
+            return self._send(200, {"ok": True, "coaches": list_coaches(conn)})
         finally:
             conn.close()
 
