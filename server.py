@@ -482,12 +482,20 @@ def ensure_coaches_table(conn):
               updated_at DOUBLE PRECISION NOT NULL)""")
         conn.commit()
     except Exception as e:
-        print("[db] ensure_coaches_table", e, flush=True)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        print("[db] ensure_coaches_table create", e, flush=True)
+    # If column already exists, Postgres aborts the txn — must ROLLBACK or later queries fail (25P02)
     try:
         q(conn, "ALTER TABLE coaches ADD COLUMN booking_url TEXT")
         conn.commit()
     except Exception:
-        pass  # column already exists
+        try:
+            conn.rollback()
+        except Exception:
+            pass
 
 def send_simple_email(to_email, subject, html, text):
     import ssl, urllib.error, urllib.request
