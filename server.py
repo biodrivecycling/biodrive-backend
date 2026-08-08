@@ -487,7 +487,7 @@ def ensure_coaches_table(conn):
         except Exception:
             pass
         print("[db] ensure_coaches_table create", e, flush=True)
-    # If column already exists, Postgres aborts the txn — must ROLLBACK or later queries fail (25P02)
+    # Add booking_url if missing (Postgres aborts txn on duplicate column)
     try:
         q(conn, "ALTER TABLE coaches ADD COLUMN booking_url TEXT")
         conn.commit()
@@ -705,6 +705,44 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(204); self._cors(); self.end_headers()
     def do_GET(self):
         path = urlparse(self.path).path
+        if path == "/api/coaches/directory":
+            conn = connect()
+            try:
+                ensure_coaches_table(conn)
+                cur = q(conn, "SELECT * FROM coaches WHERE link_enabled = 1 ORDER BY name ASC")
+                out = []
+                while True:
+                    row = one(cur)
+                    if not row:
+                        break
+                    name = (g(row, "name") or "").strip()
+                    if not name:
+                        continue
+                    slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-") or "coach"
+                    out.append({
+                        "id": g(row, "id") or ("coach_" + slug),
+                        "slug": slug,
+                        "displayName": name,
+                        "name": name,
+                        "email": g(row, "email") or "",
+                        "status": "active",
+                        "supportedServices": ["2", "3"],
+                        "bookingUrl": g(row, "booking_url") or "",
+                        "pricing": {"currency": "USD", "hourlyRate": None, "rateLabel": ""},
+                        "location": {
+                            "region": "",
+                            "timezone": "",
+                            "remote": True,
+                            "inPerson": False,
+                            "regionKeywords": [],
+                        },
+                        "specialties": [],
+                        "bio": "",
+                        "availabilityNote": "",
+                    })
+                return self._send(200, {"version": 1, "currency": "USD", "source": "admin", "coaches": out})
+            finally:
+                conn.close()
         if path == "/api/coaches/booking-links":
             conn = connect()
             try:
@@ -721,7 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.14, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.16, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -979,6 +1017,10 @@ class Handler(BaseHTTPRequestHandler):
                     "linkEnabled": True, "magicLink": link, "bookingUrl": booking_url or "",
                 }, "coaches": list_coaches(conn)})
             except Exception as e:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 print("[admin] create coach", type(e).__name__, e, flush=True)
                 return self._send(500, {"error": "Could not create coach: %s: %s" % (type(e).__name__, e)})
         finally:
