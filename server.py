@@ -759,7 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.16, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.17, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -895,11 +895,28 @@ class Handler(BaseHTTPRequestHandler):
         if not email or not EMAIL_RE.match(email): return self._send(400, {"error": "Please enter a valid email."})
         err = strong_password(password)
         if err: return self._send(400, {"error": err})
-        pw_hash, salt = hash_password(password)
-        user_id = "usr_" + secrets.token_hex(12)
-        now = time.time()
+
+        # Explicit existence check (do not rely only on INSERT unique-constraint text)
         conn = connect()
         try:
+            existing = one(q(conn, "SELECT id, email, email_verified FROM users WHERE email = ?", (email,)))
+            if existing:
+                verified = bool(g(existing, "email_verified"))
+                if verified:
+                    return self._send(409, {
+                        "error": "An account with that email already exists.",
+                        "code": "EMAIL_EXISTS",
+                    })
+                # Unverified account: block re-registration, but make recovery clear
+                return self._send(409, {
+                    "error": "An account with that email already exists but is not verified. Use Resend verification on the login page, or contact support.",
+                    "code": "EMAIL_EXISTS_UNVERIFIED",
+                    "email": email,
+                })
+
+            pw_hash, salt = hash_password(password)
+            user_id = "usr_" + secrets.token_hex(12)
+            now = time.time()
             try:
                 q(conn, "INSERT INTO users (id, email, password_hash, password_salt, first_name, last_name, email_verified, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?)",
                   (user_id, email, pw_hash, salt, first, last, now, now))
@@ -907,21 +924,29 @@ class Handler(BaseHTTPRequestHandler):
                 set_json(conn, "profiles", user_id, {"firstName": first, "lastName": last, "name": (first+" "+last).strip(), "email": email, "bikes": []})
                 conn.commit()
             except Exception as e:
-                conn.rollback()
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
                 msg = str(e).lower()
+                # Race: another request inserted the same email between SELECT and INSERT
                 if "unique" in msg or "duplicate" in msg:
-                    return self._send(409, {"error": "An account with that email already exists."})
-                print("signup error", e)
+                    return self._send(409, {
+                        "error": "An account with that email already exists.",
+                        "code": "EMAIL_EXISTS",
+                    })
+                print("signup error", type(e).__name__, e, flush=True)
                 return self._send(500, {"error": "Could not create account."})
         finally:
             conn.close()
+
         body = {"ok": True, "message": "Account created. Please verify your email to continue.",
                 "user": {"id": user_id, "email": email, "firstName": first, "lastName": last, "emailVerified": False}}
         # Real email when Resend is configured and demo mode is off
         if RESEND_API_KEY and not DEMO_EMAIL:
             ok_send, detail = send_verification_email(email, verify_token)
             if not ok_send:
-                body["message"] = "Account created, but the verification email could not be sent. Please try resend or contact support."
+                body["message"] = "Account created, but the verification email could not be sent. Please use Resend verification on the login page or contact support."
                 body["emailError"] = True
                 print("[email] signup send failed:", detail, flush=True)
             else:
