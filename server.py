@@ -759,7 +759,7 @@ class Handler(BaseHTTPRequestHandler):
             finally:
                 conn.close()
         if path == "/api/health":
-            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.17, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
+            return self._send(200, {"ok": True, "service": "biodrive-auth", "version": 2.18, "demoEmail": DEMO_EMAIL, "emailConfigured": bool(RESEND_API_KEY), "adminConfigured": bool(ADMIN_KEY), "emailFrom": EMAIL_FROM, "database": "postgres" if USE_PG else "sqlite"})
         if path == "/api/email-status":
             result = check_resend_api()
             return self._send(200 if result.get("ok") else 502, {"emailFrom": EMAIL_FROM, "demoEmail": DEMO_EMAIL, "resend": result})
@@ -861,6 +861,7 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/admin/coaches/booking-url": return self._admin_set_booking_url(data)
         if path == "/api/admin/orders/mark-paid": return self._admin_mark_paid(data)
         if path == "/api/admin/orders/attach-gpx": return self._admin_attach_gpx(data)
+        if path == "/api/admin/orders/delete": return self._admin_delete_order(data)
         if path == "/api/coach/accept": return self._coach_respond(data, accept=True)
         if path == "/api/coach/reject": return self._coach_respond(data, accept=False)
         return self._send(404, {"error": "Not found."})
@@ -1186,6 +1187,31 @@ class Handler(BaseHTTPRequestHandler):
                     html = "<p>Hi %s,</p><p>A BioDrive athlete request is ready for you (paid).</p><p><a href='%s'>Open your coach jobs</a></p>" % (cname, link)
                     send_simple_email(cemail, "New BioDrive coaching request", html, "Open your jobs: " + link)
             return self._send(200, {"ok": True, "orders": list_all_orders(conn)})
+        finally:
+            conn.close()
+
+    def _admin_delete_order(self, data):
+        if not ADMIN_KEY or not require_admin(self):
+            return self._send(401, {"error": "Invalid or missing admin key."})
+        oid = (data.get("id") or data.get("orderId") or "").strip()
+        if not oid:
+            return self._send(400, {"error": "Order id is required."})
+        conn = connect()
+        try:
+            row = load_order(conn, oid)
+            if not row:
+                return self._send(404, {"error": "Order not found."})
+            q(conn, "DELETE FROM strategy_orders WHERE id = ?", (oid,))
+            conn.commit()
+            print("[admin] deleted order", oid, flush=True)
+            return self._send(200, {"ok": True, "orders": list_all_orders(conn)})
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            print("[admin] delete order", type(e).__name__, e, flush=True)
+            return self._send(500, {"error": "Could not delete request: %s" % e})
         finally:
             conn.close()
 
