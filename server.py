@@ -685,6 +685,24 @@ class Handler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-Admin-Key, X-Coach-Key")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
         self.send_header("Vary", "Origin")
+    
+    def handle_track(self):
+        try:
+            length = int(self.headers.get('Content-Length', 0))
+            body = self.rfile.read(length).decode('utf-8') if length else '{}'
+            data = json.loads(body)
+            path = str(data.get('path', '/'))[:500]
+
+            day_salt = datetime.utcnow().strftime('%Y-%m-%d')
+            raw = (self.client_address[0] or '') + (self.headers.get('User-Agent') or '') + day_salt
+            visitor_hash = hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+            print(f"[track] {path} {visitor_hash}")
+        except Exception as e:
+            print(f"[track] error: {e}")
+
+        self.send_response(204)
+        self.end_headers()
     def _read_json(self):
         n = int(self.headers.get("Content-Length") or 0)
         if n <= 0: return {}
