@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
 """BioDrive API — auth + profile/powers. Uses Postgres if DATABASE_URL set, else SQLite."""
+import hashlib
+from datetime import datetime
 from __future__ import annotations
 import hashlib, json, os, re, secrets, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
