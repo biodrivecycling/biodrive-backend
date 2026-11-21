@@ -4,7 +4,8 @@ from __future__ import annotations
 import hashlib, json, os, re, secrets, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, unquote, quote
-
+import hashlib
+from datetime import datetime
 HOST = os.environ.get("BD_HOST") or os.environ.get("HOST") or "0.0.0.0"
 PORT = int(os.environ.get("BD_PORT") or os.environ.get("PORT") or "8787")
 DATABASE_URL = (os.environ.get("DATABASE_URL") or "").strip()
